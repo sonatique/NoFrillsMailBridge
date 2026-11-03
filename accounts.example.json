@@ -1,0 +1,19 @@
+{
+  "saveDir": "C:\\Temp\\MailBridge",
+  "accounts": [
+    {
+      "name": "perso",
+      "host": "imap.example.com",
+      "port": 993,
+      "security": "ssl",
+      "user": "me@example.com",
+      "passwordEnv": "MAILBRIDGE_PERSO_PASSWORD"
+    },
+    {
+      "name": "asso",
+      "host": "imap.example.org",
+      "user": "contact@example.org",
+      "password": "app-password"
+    }
+  ]
+}
