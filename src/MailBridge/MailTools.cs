@@ -6,7 +6,10 @@ using System.Text.RegularExpressions;
 using MailKit;
 using MailKit.Net.Imap;
 using MailKit.Search;
+using MailKit.Security;
 using MimeKit;
+using MimeKit.Text;
+using ModelContextProtocol;
 using ModelContextProtocol.Server;
 
 namespace MailBridge;
@@ -15,6 +18,10 @@ namespace MailBridge;
 public static class MailTools
 {
     private const string AccountHelp = "Account name, a comma separated list of names, or 'all'.";
+    private const int ConnectTimeoutMs = 30_000;
+
+    // Stays under the 255 byte file name limit of Linux file systems, even with 3 byte characters.
+    private const int MaxFileNameLength = 80;
 
     [McpServerTool(Name = "list_accounts"), Description("Lists the configured mail accounts.")]
     public static string ListAccounts() =>
@@ -63,6 +70,9 @@ public static class MailTools
         [Description("Maximum number of results per account.")] int maxResults = 30,
         CancellationToken ct = default)
     {
+        var sinceDate = ParseDate(since, nameof(since));
+        var beforeDate = ParseDate(before, nameof(before));
+
         var parts = await Task.WhenAll(Config.Resolve(account).Select(a => PerAccount(a, async () =>
         {
             using var client = await ConnectAsync(a, ct);
@@ -76,9 +86,9 @@ public static class MailTools
                 query = query.And(SearchQuery.SubjectContains(subject));
             if (!string.IsNullOrWhiteSpace(text))
                 query = query.And(SearchQuery.SubjectContains(text).Or(SearchQuery.BodyContains(text)));
-            if (TryDate(since) is { } s)
+            if (sinceDate is { } s)
                 query = query.And(SearchQuery.DeliveredAfter(s));
-            if (TryDate(before) is { } b)
+            if (beforeDate is { } b)
                 query = query.And(SearchQuery.DeliveredBefore(b));
 
             var found = await box.SearchAsync(query, ct);
@@ -95,9 +105,11 @@ public static class MailTools
                 foreach (var m in (await box.FetchAsync(uids, items, ct)).OrderByDescending(x => x.UniqueId.Id))
                 {
                     var date = (m.Envelope?.Date ?? m.InternalDate)?.ToString("yyyy-MM-dd HH:mm");
-                    var files = string.Join(", ", m.Attachments.Select(x => x.FileName ?? x.ContentType.Name));
-                    sb.AppendLine($"uid={m.UniqueId.Id} | {date} | {m.Envelope?.From} | {m.Envelope?.Subject}" +
-                                  (files.Length > 0 ? $" | attachments: {files}" : ""));
+                    var files = string.Join(", ", m.BodyParts
+                        .Where(x => x.IsAttachment || x.FileName is not null)
+                        .Select(x => string.IsNullOrWhiteSpace(x.FileName) ? "attachment" : x.FileName));
+                    sb.AppendLine(OneLine($"uid={m.UniqueId.Id} | {date} | {m.Envelope?.From} | {m.Envelope?.Subject}" +
+                                          (files.Length > 0 ? $" | attachments: {files}" : "")));
                 }
             }
 
@@ -117,30 +129,34 @@ public static class MailTools
         CancellationToken ct = default)
     {
         var a = Config.ResolveOne(account);
-        using var client = await ConnectAsync(a, ct);
-        var box = await client.GetFolderAsync(folder, ct);
-        await box.OpenAsync(FolderAccess.ReadOnly, ct);
-        var msg = await box.GetMessageAsync(new UniqueId(uid), ct);
-        await client.DisconnectAsync(true, ct);
+        return await WithRealError(async () =>
+        {
+            using var client = await ConnectAsync(a, ct);
+            var box = await client.GetFolderAsync(folder, ct);
+            await box.OpenAsync(FolderAccess.ReadOnly, ct);
+            var msg = await box.GetMessageAsync(new UniqueId(uid), ct);
+            await client.DisconnectAsync(true, ct);
 
-        var body = msg.TextBody ?? HtmlToText(msg.HtmlBody) ?? "";
-        if (body.Length > maxChars)
-            body = body[..maxChars] + "\n[truncated]";
+            var body = string.IsNullOrWhiteSpace(msg.TextBody) ? HtmlToText(msg.HtmlBody) ?? "" : msg.TextBody;
+            if (body.Length > maxChars)
+                body = body[..maxChars] + "\n[truncated]";
 
-        var files = msg.Attachments.Select(AttachmentName).ToList();
+            var files = AttachmentParts(msg).Select(AttachmentName).ToList();
 
-        var sb = new StringBuilder();
-        sb.AppendLine($"Account: {a.Name}");
-        sb.AppendLine($"From: {msg.From}");
-        sb.AppendLine($"To: {msg.To}");
-        if (msg.Cc.Count > 0)
-            sb.AppendLine($"Cc: {msg.Cc}");
-        sb.AppendLine($"Date: {msg.Date:yyyy-MM-dd HH:mm}");
-        sb.AppendLine($"Subject: {msg.Subject}");
-        sb.AppendLine($"Attachments: {(files.Count == 0 ? "none" : string.Join(", ", files))}");
-        sb.AppendLine();
-        sb.Append(body);
-        return sb.ToString();
+            var sb = new StringBuilder();
+            void Header(string line) => sb.AppendLine(OneLine(line));
+            Header($"Account: {a.Name}");
+            Header($"From: {msg.From}");
+            Header($"To: {msg.To}");
+            if (msg.Cc.Count > 0)
+                Header($"Cc: {msg.Cc}");
+            Header($"Date: {msg.Date:yyyy-MM-dd HH:mm}");
+            Header($"Subject: {msg.Subject}");
+            Header($"Attachments: {(files.Count == 0 ? "none" : string.Join(", ", files))}");
+            sb.AppendLine();
+            sb.Append(body);
+            return sb.ToString();
+        });
     }
 
     [McpServerTool(Name = "save_attachments"),
@@ -156,39 +172,53 @@ public static class MailTools
             return "saveDir is not set in the configuration file.";
 
         var a = Config.ResolveOne(account);
-        using var client = await ConnectAsync(a, ct);
-        var box = await client.GetFolderAsync(folder, ct);
-        await box.OpenAsync(FolderAccess.ReadOnly, ct);
-        var msg = await box.GetMessageAsync(new UniqueId(uid), ct);
-        await client.DisconnectAsync(true, ct);
-
-        var dir = Path.Combine(saveDir, a.Name, $"{msg.Date:yyyyMMdd}_uid{uid}");
-        Directory.CreateDirectory(dir);
-
-        var saved = new List<string>();
-        foreach (var entity in msg.Attachments)
+        return await WithRealError(async () =>
         {
-            var path = UniquePath(dir, SafeName(AttachmentName(entity)));
-            await using var stream = File.Create(path);
+            using var client = await ConnectAsync(a, ct);
+            var box = await client.GetFolderAsync(folder, ct);
+            await box.OpenAsync(FolderAccess.ReadOnly, ct);
+            var msg = await box.GetMessageAsync(new UniqueId(uid), ct);
+            await client.DisconnectAsync(true, ct);
 
-            switch (entity)
+            var dir = Path.Combine(saveDir, a.Name, $"{msg.Date:yyyyMMdd}_uid{uid}");
+            Directory.CreateDirectory(dir);
+
+            var saved = new List<string>();
+            foreach (var entity in AttachmentParts(msg))
             {
-                case MessagePart mp:
-                    if (mp.Message is not null)
-                        await mp.Message.WriteToAsync(stream, ct);
-                    break;
-                case MimePart part:
-                    if (part.Content is not null)
-                        await part.Content.DecodeToAsync(stream, ct);
-                    break;
-                default:
-                    continue;
+                var name = SafeName(AttachmentName(entity));
+                try
+                {
+                    var path = UniquePath(dir, name);
+                    // Closed before the path is listed: the final flush can still fail on a full disk.
+                    await using (var stream = File.Create(path))
+                    {
+                        switch (entity)
+                        {
+                            case MessagePart mp:
+                                if (mp.Message is not null)
+                                    await mp.Message.WriteToAsync(stream, ct);
+                                break;
+                            case MimePart part:
+                                if (part.Content is not null)
+                                    await part.Content.DecodeToAsync(stream, ct);
+                                break;
+                            default:
+                                continue;
+                        }
+                    }
+
+                    saved.Add(path);
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    // One unwritable file must not lose the others or the paths already saved.
+                    saved.Add($"Error saving '{name}': {ex.Message}");
+                }
             }
 
-            saved.Add(path);
-        }
-
-        return saved.Count == 0 ? "No attachments." : string.Join('\n', saved);
+            return saved.Count == 0 ? "No attachments." : string.Join('\n', saved);
+        });
     }
 
     // Isolates failures so one unreachable account does not hide the others.
@@ -204,28 +234,96 @@ public static class MailTools
         }
     }
 
-    private static async Task<ImapClient> ConnectAsync(AccountConfig account, CancellationToken ct)
+    // The MCP library replaces the text of any exception but McpException, which would hide the cause from the client.
+    private static async Task<string> WithRealError(Func<Task<string>> work)
     {
-        var client = new ImapClient();
-        await client.ConnectAsync(account.Host, account.Port, account.SocketOptions, ct);
-        await client.AuthenticateAsync(account.User, account.ResolvePassword(), ct);
-        return client;
+        try
+        {
+            return await work();
+        }
+        catch (Exception ex) when (ex is not (McpException or OperationCanceledException))
+        {
+            throw new McpException(ex.Message, ex);
+        }
     }
 
-    private static DateTime? TryDate(string? value) =>
-        DateTime.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.None, out var d) ? d : null;
+    private static async Task<ImapClient> ConnectAsync(AccountConfig account, CancellationToken ct)
+    {
+        var password = account.ResolvePassword();
+        var client = new ImapClient();
+        var commandTimeout = client.Timeout;
+        client.Timeout = ConnectTimeoutMs;
+        try
+        {
+            await client.ConnectAsync(account.Host, account.Port, account.SocketOptions, ct);
+            await client.AuthenticateAsync(account.User, password, ct);
+            // A full text search can rightly stay silent longer than a login.
+            // Known limit: a server that hangs after login still costs this default timeout. Add a per-account deadline if that shows up.
+            client.Timeout = commandTimeout;
+            return client;
+        }
+        catch (Exception ex)
+        {
+            client.Dispose();
+            // MailKit blames the certificate when a server goes silent during the TLS handshake.
+            if (ex is SslHandshakeException { InnerException: TimeoutException timeout })
+                throw timeout;
+            throw;
+        }
+    }
+
+    internal static DateTime? ParseDate(string? value, string name)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return null;
+        return DateTime.TryParseExact(value.Trim(), "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var d)
+            ? d
+            : throw new McpException($"Invalid date for '{name}': '{value}'. Use yyyy-MM-dd.");
+    }
+
+    // Attachments alone misses files marked inline or not marked at all, as some mail programs send PDFs.
+    internal static IEnumerable<MimeEntity> AttachmentParts(MimeMessage msg) =>
+        msg.BodyParts.Where(p => p.IsAttachment || (p.ContentDisposition?.FileName ?? p.ContentType.Name) is not null);
 
     private static string AttachmentName(MimeEntity entity) => entity switch
     {
-        MessagePart mp => (mp.ContentDisposition?.FileName ?? "message") + ".eml",
-        MimePart part => part.FileName ?? part.ContentType.Name ?? "attachment",
+        MessagePart mp => (mp.ContentDisposition?.FileName ?? mp.ContentType.Name ?? "message") + ".eml",
+        MimePart part when !string.IsNullOrWhiteSpace(part.FileName) => part.FileName,
         _ => "attachment",
     };
 
-    private static string SafeName(string name)
+    private static bool BreaksLine(char c) =>
+        char.IsControl(c) || char.GetUnicodeCategory(c) is UnicodeCategory.LineSeparator or UnicodeCategory.ParagraphSeparator;
+
+    // Headers and names can hold encoded line breaks, which would forge extra output lines.
+    internal static string OneLine(string text) => string.Concat(text.Select(c => BreaksLine(c) ? ' ' : c));
+
+    internal static string SafeName(string name)
     {
-        var clean = string.Concat(Path.GetFileName(name).Select(c => Path.GetInvalidFileNameChars().Contains(c) ? '_' : c));
-        return clean.Length == 0 ? "attachment" : clean;
+        var invalid = Path.GetInvalidFileNameChars();
+        // Windows drops trailing dots and spaces, which would turn ".." into the parent folder.
+        var clean = new string(Path.GetFileName(name)
+            .Select(c => BreaksLine(c) || invalid.Contains(c) ? '_' : c)
+            .ToArray()).TrimEnd('.', ' ');
+
+        if (clean.Length > MaxFileNameLength)
+        {
+            var extension = Path.GetExtension(clean);
+            if (extension.Length > 10)
+                extension = "";
+            var cut = MaxFileNameLength - extension.Length;
+            if (char.IsHighSurrogate(clean[cut - 1]))
+                cut--;
+            clean = clean[..cut].TrimEnd('.', ' ') + extension;
+        }
+
+        if (clean.Length == 0)
+            return "attachment";
+
+        // Windows opens a device for these names, so the data would vanish while the save looks fine.
+        return Regex.IsMatch(clean, "^(CON|PRN|AUX|NUL|CONIN\\$|CONOUT\\$|COM[0-9\u00B9\u00B2\u00B3]|LPT[0-9\u00B9\u00B2\u00B3]) *(\\.|$)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)
+            ? "_" + clean
+            : clean;
     }
 
     private static string UniquePath(string dir, string name)
@@ -236,13 +334,71 @@ public static class MailTools
         return path;
     }
 
-    private static string? HtmlToText(string? html)
+    // These tags start a new line. Any other tag sits inside a line and must not split a word or an amount.
+    // Known limit: adjacent links and spans styled display:block still join up. Read the style attribute if that hurts.
+    private static readonly HashSet<HtmlTagId> LineBreakTags =
+    [
+        HtmlTagId.Address, HtmlTagId.Article, HtmlTagId.Aside, HtmlTagId.BlockQuote, HtmlTagId.Body, HtmlTagId.Br, HtmlTagId.Caption,
+        HtmlTagId.Center, HtmlTagId.DD, HtmlTagId.Details, HtmlTagId.Dir, HtmlTagId.Div, HtmlTagId.DL, HtmlTagId.DT, HtmlTagId.FieldSet,
+        HtmlTagId.FigCaption, HtmlTagId.Figure, HtmlTagId.Footer, HtmlTagId.Form, HtmlTagId.H1, HtmlTagId.H2,
+        HtmlTagId.H3, HtmlTagId.H4, HtmlTagId.H5, HtmlTagId.H6, HtmlTagId.Head, HtmlTagId.Header, HtmlTagId.HR, HtmlTagId.Html,
+        HtmlTagId.Legend, HtmlTagId.LI,
+        HtmlTagId.Main, HtmlTagId.Menu, HtmlTagId.Nav, HtmlTagId.OL, HtmlTagId.Option, HtmlTagId.P, HtmlTagId.Pre, HtmlTagId.Section,
+        HtmlTagId.Summary, HtmlTagId.Table, HtmlTagId.TBody, HtmlTagId.Tfoot, HtmlTagId.THead, HtmlTagId.Title, HtmlTagId.TR, HtmlTagId.UL,
+    ];
+
+    // A tokenizer plus one pass stays linear on hostile mail. Regex does not: backtracking can hang, and
+    // NonBacktracking kept about 1 GB per MB of input in its cache, then returned wrong matches for later mails.
+    // Known limit: attribute spam costs about 60 times the HTML size in short-lived memory. Cap the HTML size if that ever hurts.
+    internal static string? HtmlToText(string? html)
     {
         if (html is null)
             return null;
-        var noBlocks = Regex.Replace(html, "(?is)<(script|style)[^>]*>.*?</\\1>", " ");
-        var lines = Regex.Replace(noBlocks, "(?i)<br\\s*/?>|</p>|</div>|</tr>", "\n");
-        var plain = WebUtility.HtmlDecode(Regex.Replace(lines, "<[^>]+>", " "));
-        return Regex.Replace(plain, "[ \\t]+", " ").Trim();
+
+        var text = new StringBuilder();
+        char? gap = null; // The separator owed before the next visible character.
+        var hidden = false;
+        // WebUtility below, because the tokenizer leaves references such as the common &#13; as literal text.
+        var tokenizer = new HtmlTokenizer(new StringReader(html)) { DecodeCharacterReferences = false };
+        while (tokenizer.ReadNextToken(out var token))
+        {
+            switch (token)
+            {
+                // The tokenizer returns the content of these as text, with any markup inside it left as is.
+                case HtmlTagToken { Id: HtmlTagId.Script or HtmlTagId.Style or HtmlTagId.NoScript or HtmlTagId.IFrame or HtmlTagId.NoEmbed or HtmlTagId.NoFrames } tag:
+                    hidden = !tag.IsEndTag && !tag.IsEmptyElement;
+                    break;
+                case HtmlTagToken { Id: HtmlTagId.TD or HtmlTagId.TH or HtmlTagId.Image }:
+                    gap ??= ' ';
+                    break;
+                case HtmlTagToken tag when LineBreakTags.Contains(tag.Id):
+                    gap = '\n';
+                    break;
+                case HtmlDataToken data when !hidden:
+                    foreach (var c in WebUtility.HtmlDecode(data.Data))
+                    {
+                        if (c is '\n' or '\r')
+                        {
+                            gap = '\n';
+                        }
+                        else if (char.IsWhiteSpace(c))
+                        {
+                            gap ??= ' ';
+                        }
+                        // Invisible filler after a gap is not a word: it must not use up maxChars.
+                        else if ((gap is null && text.Length > 0) || char.GetUnicodeCategory(c) is not (UnicodeCategory.Format or UnicodeCategory.NonSpacingMark))
+                        {
+                            if (gap is { } separator && text.Length > 0)
+                                text.Append(separator);
+                            gap = null;
+                            text.Append(c);
+                        }
+                    }
+
+                    break;
+            }
+        }
+
+        return text.ToString();
     }
 }

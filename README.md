@@ -16,22 +16,27 @@ Each account gets a nickname and its own settings. Tools take one nickname, a co
 
 - `account` is a nickname, a comma separated list of nicknames, or `all` (default for the listing and search tools).
 - `read_message` and `save_attachments` need exactly one account, because uids are only meaningful per account and folder.
-- `search_messages` filters are optional and combined with AND. Dates use `yyyy-MM-dd`; `since` is inclusive, `before` is exclusive. Results are the most recent matches first.
-- `save_attachments` writes to `<saveDir>/<nickname>/<yyyyMMdd>_uid<uid>/` and returns the file paths.
+- `search_messages` filters are optional and combined with AND. Dates use `yyyy-MM-dd`, and any other format is an error; `since` is inclusive, `before` is exclusive. Results are the most recent matches first.
+- Attachments are the parts marked as attachment plus any other part with a file name, so inline PDFs and inline images are listed too.
+- `save_attachments` writes to `<saveDir>/<nickname>/<yyyyMMdd>_uid<uid>/` and returns the file paths. A file that cannot be written is reported in the result and does not stop the others.
 
 Folders are always opened read-only. Nothing is deleted, moved or sent. A failing account is reported under its own nickname without hiding the others.
 
 ## Build
 
-Requires the .NET 8 SDK.
+Requires the .NET 10 SDK.
 
     dotnet build MailBridge.sln -c Release
+
+Self-check of the parsing and file name rules:
+
+    dotnet run --project tests/MailBridge.Tests -c Release
 
 Single file executable for Windows:
 
     dotnet publish src/MailBridge/MailBridge.csproj -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -o out
 
-The result is `out/MailBridge.exe`. It needs the .NET 8 runtime on the target machine.
+The result is `out/MailBridge.exe`. It needs the .NET 10 runtime on the target machine.
 
 ## Configuration
 
